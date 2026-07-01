@@ -1,164 +1,249 @@
 """Sync Garmin activities to the Notion Activities database."""
 
-import logging
-from typing import Any, Dict, List, Optional
+from __future__ import annotations
 
-from garminconnect import Garmin
-from notion_client import Client
+import logging
+from datetime import datetime, timedelta
+
+from garminconnect import Garmin as GarminClient
+from notion_client import Client as NotionClient
+
+from garmin_to_notion.config import Settings
+from garmin_to_notion.formatters import (
+    format_activity_type,
+    format_duration,
+    format_effect_rich,
+    format_pace,
+    format_training_effect,
+    gmt_to_local,
+)
+from garmin_to_notion.mappings import ACTIVITY_EMOJIS
 
 logger = logging.getLogger(__name__)
 
 
-def _format_duration(seconds: float) -> str:
-    """Format a duration in seconds into a human-readable string."""
-    if seconds is None:
-        return "—"
-    total = int(round(seconds))
-    hours, remainder = divmod(total, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours > 0:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
+def _build_properties(activity: dict, settings: Settings) -> dict:
+    """Build the Notion properties payload from a Garmin activity."""
+    activity_name = activity.get("activityName", "Unnamed Activity")
+    activity_type, activity_subtype = format_activity_type(
+        activity.get("activityType", {}).get("typeKey", "Unknown"),
+        activity_name,
+    )
+    local_date = gmt_to_local(activity.get("startTimeGMT"), settings.timezone)
 
+    # Heatmap properties
+    day_of_week = local_date.strftime("%A")
+    hour = local_date.hour
+    block_start = (hour // 2) * 2
+    hour_block = f"{block_start:02d}:00-{block_start + 2:02d}:00"
 
-def _format_distance(meters: Optional[float]) -> str:
-    """Format a distance in meters into kilometers."""
-    if meters is None:
-        return "—"
-    return f"{meters / 1000:.2f} km"
-
-
-def _format_pace(seconds_per_km: Optional[float]) -> str:
-    """Format pace (seconds per km) into a mm:ss/km string."""
-    if seconds_per_km is None or seconds_per_km <= 0:
-        return "—"
-    total = int(round(seconds_per_km))
-    minutes, secs = divmod(total, 60)
-    return f"{minutes}:{secs:02d} /km"
-
-
-def _rich_text(content: str) -> List[Dict[str, Any]]:
-    """Build a Notion rich text cell value."""
-    return [{"type": "text", "text": {"content": content}}]
-
-
-def fetch_garmin_splits_blocks(
-    garmin: Garmin, activity_id: str
-) -> List[Dict[str, Any]]:
-    """
-    Fetch Garmin activity splits (laps) and format them as Notion table blocks.
-
-    The table includes columns: Lap, Distance, Duration, Pace, and Average HR.
-    Returns a list containing a single Notion table block (with table_row children)
-    suitable for use as children in notion.pages.create / notion.pages.update.
-    """
-    headers = ["Lap", "Distance", "Duration", "Pace", "Avg HR"]
-    rows: List[List[str]] = []
-
-    try:
-        splits = garmin.get_activity_splits(activity_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to fetch splits for activity %s: %s", activity_id, exc)
-        splits = None
-
-    lap_data: List[Dict[str, Any]] = []
-    if splits:
-        if isinstance(splits, dict):
-            lap_data = splits.get("lapSplits", []) or splits.get("laps", []) or []
-        elif isinstance(splits, list):
-            lap_data = splits
-
-    for index, lap in enumerate(lap_data, start=1):
-        distance = lap.get("distance") or lap.get("distanceMeters")
-        duration = lap.get("duration") or lap.get("elapsedDuration")
-        avg_hr = lap.get("averageHR") or lap.get("avgHr") or lap.get("averageHeartRate")
-
-        if distance is not None and duration is not None and distance > 0:
-            pace = duration / (distance / 1000)
-        else:
-            pace = None
-
-        rows.append(
-            [
-                str(index),
-                _format_distance(distance),
-                _format_duration(duration),
-                _format_pace(pace),
-                f"{int(avg_hr)} bpm" if avg_hr else "—",
+    return {
+        "Date": {"date": {"start": local_date.isoformat()}},
+        "Type": {"select": {"name": activity_type}},
+        "SubType": {"select": {"name": activity_subtype}},
+        "Name": {"title": [{"text": {"content": activity_name}}]},
+        "Distance (km)": {"number": round(activity.get("distance", 0) / 1000, 2)},
+        "Duration": {
+            "rich_text": [
+                {"text": {"content": format_duration(activity.get("duration", 0))}}
             ]
-        )
-
-    table_block: Dict[str, Any] = {
-        "object": "block",
-        "type": "table",
-        "table": {
-            "table_width": len(headers),
-            "has_column_header": True,
-            "has_row_header": False,
-            "children": [
-                {
-                    "type": "table_row",
-                    "table_row": {"cells": [_rich_text(h) for h in headers]},
-                }
-            ],
         },
+        "Calories": {"number": round(activity.get("calories", 0))},
+        "Avg Pace": {
+            "rich_text": [
+                {"text": {"content": format_pace(activity.get("averageSpeed", 0))}}
+            ]
+        },
+        "Avg HR": {"number": round(activity.get("averageHR", 0) or 0)},
+        "Max HR": {"number": round(activity.get("maxHR", 0) or 0)},
+        "Avg Power": {"number": round(activity.get("avgPower", 0) or 0, 1)},
+        "Training Effect": {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": format_training_effect(
+                            activity.get("trainingEffectLabel", "Unknown")
+                        )
+                    }
+                }
+            ]
+        },
+        "Aerobic Effect": {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": format_effect_rich(
+                            activity.get("aerobicTrainingEffect", 0) or 0,
+                            activity.get("aerobicTrainingEffectMessage", "Unknown"),
+                        )
+                    }
+                }
+            ]
+        },
+        "Anaerobic Effect": {
+            "rich_text": [
+                {
+                    "text": {
+                        "content": format_effect_rich(
+                            activity.get("anaerobicTrainingEffect", 0) or 0,
+                            activity.get("anaerobicTrainingEffectMessage", "Unknown"),
+                        )
+                    }
+                }
+            ]
+        },
+        "Steps": {"number": activity.get("steps", 0) or 0},
+        "Garmin ID": {"number": activity.get("activityId")},
+        "Day of Week": {"select": {"name": day_of_week}},
+        "Hour Block": {"select": {"name": hour_block}},
     }
 
-    for row in rows:
-        table_block["table"]["children"].append(
-            {"type": "table_row", "table_row": {"cells": [_rich_text(c) for c in row]}}
-        )
 
-    return [table_block]
+def _get_icon_emoji(activity: dict) -> str:
+    """Get the emoji icon for an activity based on its type."""
+    activity_name = activity.get("activityName", "")
+    _, activity_subtype = format_activity_type(
+        activity.get("activityType", {}).get("typeKey", "Unknown"),
+        activity_name,
+    )
+    return ACTIVITY_EMOJIS.get(activity_subtype, ACTIVITY_EMOJIS["Other"])
+
+
+def _activity_exists(
+    notion: NotionClient,
+    database_id: str,
+    garmin_id: int | None,
+    activity_date: datetime,
+    activity_type: str,
+    activity_name: str,
+) -> dict | None:
+    """Check if an activity already exists in the Notion database.
+
+    Primary lookup: by Garmin ID (unique). Fallback: date + type + name.
+    """
+    if garmin_id:
+        query = notion.databases.query(
+            database_id=database_id,
+            filter={"property": "Garmin ID", "number": {"equals": garmin_id}},
+        )
+        if query["results"]:
+            return query["results"][0]
+
+    # Fallback for legacy entries without Garmin ID
+    lookup_type = (
+        "Stretching" if "stretch" in activity_name.lower() else activity_type
+    )
+    lookup_min = activity_date - timedelta(minutes=5)
+    lookup_max = activity_date + timedelta(minutes=5)
+
+    query = notion.databases.query(
+        database_id=database_id,
+        filter={
+            "and": [
+                {
+                    "property": "Date",
+                    "date": {"on_or_after": lookup_min.isoformat()},
+                },
+                {
+                    "property": "Date",
+                    "date": {"on_or_before": lookup_max.isoformat()},
+                },
+                {"property": "Type", "select": {"equals": lookup_type}},
+                {"property": "Name", "title": {"equals": activity_name}},
+            ]
+        },
+    )
+    results = query["results"]
+    return results[0] if results else None
+
+
+def _activity_needs_update(
+    existing: dict, new_activity: dict, settings: Settings
+) -> bool:
+    """Compare an existing Notion page with new Garmin data to detect changes."""
+    props = existing["properties"]
+
+    try:
+        existing_date = props["Date"]["date"]["start"]
+        new_date = gmt_to_local(
+            new_activity.get("startTimeGMT"), settings.timezone
+        ).isoformat()
+        date_changed = existing_date != new_date
+
+        distance_changed = (
+            props["Distance (km)"]["number"]
+            != round(new_activity.get("distance", 0) / 1000, 2)
+        )
+        calories_changed = (
+            props["Calories"]["number"] != round(new_activity.get("calories", 0))
+        )
+        pace_changed = (
+            props["Avg Pace"]["rich_text"][0]["text"]["content"]
+            != format_pace(new_activity.get("averageSpeed", 0))
+        )
+        hr_changed = (
+            props["Avg HR"]["number"] != round(new_activity.get("averageHR", 0) or 0)
+            or props["Max HR"]["number"]
+            != round(new_activity.get("maxHR", 0) or 0)
+        )
+        return (
+            date_changed or distance_changed or calories_changed
+            or pace_changed or hr_changed
+        )
+    except (KeyError, TypeError, IndexError):
+        return True
 
 
 def sync_activities(
-    garmin: Garmin,
-    notion: Client,
-    database_id: str,
-    activities: List[Dict[str, Any]],
-    existing_pages: Optional[Dict[str, str]] = None,
+    garmin: GarminClient,
+    notion: NotionClient,
+    settings: Settings,
 ) -> None:
-    """
-    Sync Garmin activities into a Notion database.
+    """Sync all Garmin activities to the Notion Activities database."""
+    activities = garmin.get_activities(0, settings.fetch_limit)
+    logger.info("Fetched %d activities from Garmin", len(activities))
 
-    For each activity, create or update a Notion page. The page children now
-    include a Notion table block with Garmin splits (laps) showing Lap index,
-    Distance, Duration, Pace, and Average HR.
-    """
-    existing_pages = existing_pages or {}
+    created, updated, skipped = 0, 0, 0
 
     for activity in activities:
-        activity_id = str(activity.get("activityId") or activity.get("id"))
-        if not activity_id:
-            logger.warning("Skipping activity without an ID: %s", activity)
-            continue
+        activity_name = activity.get("activityName", "Unnamed Activity")
+        activity_type, _ = format_activity_type(
+            activity.get("activityType", {}).get("typeKey", "Unknown"),
+            activity_name,
+        )
+        activity_date = gmt_to_local(activity.get("startTimeGMT"), settings.timezone)
+        garmin_id = activity.get("activityId")
 
-        title = activity.get("activityName") or activity.get("title") or f"Activity {activity_id}"
-        activity_type = activity.get("activityType", {}).get("typeKey", "unknown") if isinstance(activity.get("activityType"), dict) else activity.get("type", "unknown")
-        start_time = activity.get("startTimeLocal") or activity.get("startTime") or ""
-        distance = activity.get("distance", 0)
-        duration = activity.get("duration", 0)
+        existing = _activity_exists(
+            notion, settings.activities_db_id,
+            garmin_id, activity_date, activity_type, activity_name,
+        )
 
-        properties = {
-            "Title": {"title": [{"text": {"content": title}}]},
-            "Type": {"select": {"name": activity_type}},
-            "Date": {"date": {"start": start_time}} if start_time else {},
-            "Distance": {"number": distance},
-            "Duration": {"number": duration},
-        }
-
-        splits_blocks = fetch_garmin_splits_blocks(garmin, activity_id)
-
-        if activity_id in existing_pages:
-            page_id = existing_pages[activity_id]
-            logger.info("Updating Notion page for activity %s", activity_id)
-            notion.pages.update(page_id=page_id, properties=properties)
-            notion.blocks.children.append(block_id=page_id, children=splits_blocks)
+        if existing:
+            if _activity_needs_update(existing, activity, settings):
+                props = _build_properties(activity, settings)
+                emoji = _get_icon_emoji(activity)
+                notion.pages.update(
+                    page_id=existing["id"],
+                    properties=props,
+                    icon={"emoji": emoji},
+                )
+                updated += 1
+            else:
+                skipped += 1
         else:
-            logger.info("Creating Notion page for activity %s", activity_id)
+            props = _build_properties(activity, settings)
+            emoji = _get_icon_emoji(activity)
             notion.pages.create(
-                parent={"database_id": database_id},
-                properties=properties,
-                children=splits_blocks,
+                parent={"database_id": settings.activities_db_id},
+                properties=props,
+                icon={"emoji": emoji},
             )
+            created += 1
+
+    logger.info(
+        "Activities sync complete: %d created, %d updated, %d unchanged",
+        created,
+        updated,
+        skipped,
+    )
